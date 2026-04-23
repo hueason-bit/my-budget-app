@@ -1,3 +1,8 @@
+function doGet(e) {
+  // 加在最前面
+  if (e.parameter.method === "OPTIONS") return respond({ok:true});
+  // ... 其餘原本的程式碼
+}
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzl6WOdMDhXw2qh3h3joktXOqrlptl3fzTtNxLuLPdiGhly6MZij90cNYyUmd8BvSb_Bw/exec";
