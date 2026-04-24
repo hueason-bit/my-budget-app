@@ -1,8 +1,3 @@
-function doGet(e) {
-  // 加在最前面
-  if (e.parameter.method === "OPTIONS") return respond({ok:true});
-  // ... 其餘原本的程式碼
-}
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzl6WOdMDhXw2qh3h3joktXOqrlptl3fzTtNxLuLPdiGhly6MZij90cNYyUmd8BvSb_Bw/exec";
@@ -58,22 +53,86 @@ function exportXLSX(entries, label) {
   window.XLSX.writeFile(wb, `採買紀錄_${label}.xlsx`);
 }
 
+// ── 詳細錯誤診斷 ───────────────────────────────────────────
+function diagnose(action, err, raw) {
+  const msg = err?.message || String(err);
+  const lines = [];
+
+  // 1. 動作類型
+  const actionLabel = { add: "新增", update: "更新", delete: "刪除", list: "讀取" }[action] || action;
+  lines.push(`❌ 操作：${actionLabel}`);
+
+  // 2. 錯誤分類
+  if (msg.includes("Failed to fetch") || msg.includes("NetworkError") || msg.includes("Load failed")) {
+    lines.push("🌐 原因：網路無法連線到 Google");
+    lines.push("💡 請確認：網路是否正常 / 是否被防火牆封鎖");
+  } else if (msg.includes("invalid json") || msg.includes("JSON") || msg.includes("Unexpected token")) {
+    lines.push("📄 原因：Apps Script 回傳格式錯誤（非 JSON）");
+    lines.push("💡 請確認：Apps Script 是否有重新部署新版本");
+    if (raw) lines.push(`📋 原始回應：${String(raw).slice(0, 120)}`);
+  } else if (msg.includes("404")) {
+    lines.push("🔗 原因：Apps Script URL 錯誤或已失效");
+    lines.push("💡 請重新部署 Apps Script 並確認 URL");
+  } else if (msg.includes("403") || msg.includes("401") || msg.includes("Permission")) {
+    lines.push("🔒 原因：Google Sheets 存取權限不足");
+    lines.push("💡 請確認：部署設定中「存取權限」是否設為「所有人」");
+  } else if (msg.includes("Script") || msg.includes("Exception") || msg.includes("Error")) {
+    lines.push("⚙️ 原因：Apps Script 執行時發生錯誤");
+    lines.push(`📋 錯誤訊息：${msg}`);
+    lines.push("💡 請至 Apps Script → 執行記錄 查看詳情");
+  } else if (msg.toLowerCase().includes("timeout") || msg.includes("deadline")) {
+    lines.push("⏱️ 原因：請求逾時（Google 伺服器回應過慢）");
+    lines.push("💡 請稍後再試");
+  } else {
+    lines.push(`⚠️ 原因：${msg}`);
+  }
+
+  return lines.join("\n");
+}
+
+// ── Google Sheets via GET only (CORS-safe) ─────────────────
+async function sheetsRequest(params) {
+  const url = new URL(SCRIPT_URL);
+  Object.entries(params).forEach(([k, v]) =>
+    url.searchParams.set(k, typeof v === "object" ? JSON.stringify(v) : v)
+  );
+
+  let rawText = "";
+  let res;
+
+  try {
+    res = await fetch(url.toString(), { redirect: "follow" });
+  } catch (networkErr) {
+    throw { _diag: diagnose(params.action, networkErr), _raw: "" };
+  }
+
+  try {
+    rawText = await res.text();
+    const json = JSON.parse(rawText);
+    return json;
+  } catch (parseErr) {
+    throw { _diag: diagnose(params.action, parseErr, rawText), _raw: rawText };
+  }
+}
+
 // ── Main App ───────────────────────────────────────────────
 export default function App() {
-  const [entries, setEntries]       = useState([]);
-  const [budget, setBudget]         = useState(4000);
-  const [editBudget, setEditBudget] = useState(false);
-  const [budgetInput, setBudgetInput] = useState("4000");
-  const [viewMonth, setViewMonth]   = useState(currentYM);
-  const [form, setForm]             = useState({ item: "", unit: "", amount: "", note: "", date: todayStr });
-  const [editId, setEditId]         = useState(null);
-  const [showForm, setShowForm]     = useState(false);
+  const [entries, setEntries]           = useState([]);
+  const [budget, setBudget]             = useState(4000);
+  const [editBudget, setEditBudget]     = useState(false);
+  const [budgetInput, setBudgetInput]   = useState("4000");
+  const [viewMonth, setViewMonth]       = useState(currentYM);
+  const [form, setForm]                 = useState({ item: "", unit: "", amount: "", note: "", date: todayStr });
+  const [editId, setEditId]             = useState(null);
+  const [showForm, setShowForm]         = useState(false);
   const [deleteTarget, setDeleteTarget] = useState(null);
   const [showMonthPicker, setShowMonthPicker] = useState(false);
-  const [showExport, setShowExport] = useState(false);
-  const [sync, setSync]             = useState({ status: "idle", msg: "" }); // idle|loading|ok|error
-  const [toast, setToast]           = useState(null);
-  const xlsxLoaded                  = useRef(false);
+  const [showExport, setShowExport]     = useState(false);
+  const [sync, setSync]                 = useState({ status: "idle", msg: "" });
+  const [toast, setToast]               = useState(null);
+  const [errDialog, setErrDialog]       = useState(null); // { lines: string[] }
+  const xlsxLoaded                      = useRef(false);
+  const toastTimer                      = useRef(null);
 
   // Load SheetJS once
   useEffect(() => {
@@ -85,41 +144,55 @@ export default function App() {
   }, []);
 
   const showToast = (msg, ok = true) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
     setToast({ msg, ok });
-    setTimeout(() => setToast(null), 2800);
+    toastTimer.current = setTimeout(() => setToast(null), ok ? 2800 : 4000);
   };
 
-  // ── Google Sheets API ──────────────────────────────────
+  const showError = (diagText) => {
+    setErrDialog({ lines: diagText.split("\n") });
+  };
+
+  // ── Fetch all entries from Sheets ─────────────────────────
   const fetchAll = useCallback(async () => {
     setSync({ status: "loading", msg: "讀取中…" });
     try {
-      const res = await fetch(SCRIPT_URL);
-      const json = await res.json();
+      const json = await sheetsRequest({ action: "list" });
       if (json.ok) {
         setEntries(json.data || []);
         setSync({ status: "ok", msg: `已同步 ${new Date().toLocaleTimeString("zh-TW")}` });
-      } else throw new Error(json.error || "未知錯誤");
+      } else {
+        const diagMsg = diagnose("list", new Error(json.error || "Apps Script 回傳 ok:false"));
+        setSync({ status: "error", msg: "讀取失敗" });
+        showError(diagMsg);
+      }
     } catch (e) {
-      setSync({ status: "error", msg: "連線失敗：" + e.message });
+      const diagMsg = e._diag || diagnose("list", e);
+      setSync({ status: "error", msg: "連線失敗" });
+      showError(diagMsg);
     }
   }, []);
 
   useEffect(() => { fetchAll(); }, [fetchAll]);
 
-  const sheetsPost = useCallback(async (body) => {
-    try {
-      const res = await fetch(SCRIPT_URL, {
-        method: "POST",
-        body: JSON.stringify(body),
-      });
-      const json = await res.json();
-      if (!json.ok) throw new Error(json.error);
-      return json;
-    } catch (e) {
-      showToast("⚠️ 寫入 Sheets 失敗：" + e.message, false);
-      return null;
-    }
-  }, []);
+  // ── Write helpers (all GET) ───────────────────────────────
+  const sheetsAdd = async (entry) => {
+    const r = await sheetsRequest({ action: "add", entry });
+    if (!r.ok) throw { _diag: diagnose("add", new Error(r.error || "Apps Script 回傳 ok:false")) };
+    return r;
+  };
+
+  const sheetsUpdate = async (entry) => {
+    const r = await sheetsRequest({ action: "update", entry });
+    if (!r.ok) throw { _diag: diagnose("update", new Error(r.error || "Apps Script 回傳 ok:false")) };
+    return r;
+  };
+
+  const sheetsDelete = async (id) => {
+    const r = await sheetsRequest({ action: "delete", id });
+    if (!r.ok) throw { _diag: diagnose("delete", new Error(r.error || "Apps Script 回傳 ok:false")) };
+    return r;
+  };
 
   // ── Derived data ───────────────────────────────────────
   const filtered = useMemo(() =>
@@ -128,10 +201,10 @@ export default function App() {
     [entries, viewMonth]
   );
 
-  const monthSpent = filtered.reduce((s, e) => s + Number(e.amount), 0);
+  const monthSpent   = filtered.reduce((s, e) => s + Number(e.amount), 0);
   const monthBalance = budget - monthSpent;
-  const pct = Math.min((monthSpent / budget) * 100, 100);
-  const barColor = pct < 60 ? "#22c55e" : pct < 85 ? "#f59e0b" : "#ef4444";
+  const pct          = Math.min((monthSpent / budget) * 100, 100);
+  const barColor     = pct < 60 ? "#22c55e" : pct < 85 ? "#f59e0b" : "#ef4444";
 
   const cumulativeBalance = useMemo(() => {
     const months = [...new Set(entries.map(e => e.date?.slice(0, 7)).filter(Boolean))].filter(m => m <= viewMonth);
@@ -160,16 +233,30 @@ export default function App() {
     if (editId !== null) {
       const updated = { ...entries.find(e => e.id === editId), ...form, amount };
       setEntries(prev => prev.map(e => e.id === editId ? updated : e));
-      setSync({ status: "loading", msg: "儲存中…" });
-      const r = await sheetsPost({ action: "update", entry: updated });
-      if (r) { showToast("✅ 已更新"); setSync({ status: "ok", msg: "已同步" }); }
+      setSync({ status: "loading", msg: "更新中…" });
+      try {
+        await sheetsUpdate(updated);
+        showToast("✅ 已更新");
+        setSync({ status: "ok", msg: "已同步" });
+      } catch (e) {
+        const d = e._diag || diagnose("update", e);
+        showError(d);
+        setSync({ status: "error", msg: "更新失敗" });
+      }
       setEditId(null);
     } else {
       const entry = { id: Date.now().toString(), ...form, amount };
       setEntries(prev => [...prev, entry]);
       setSync({ status: "loading", msg: "新增中…" });
-      const r = await sheetsPost({ action: "add", entry });
-      if (r) { showToast("✅ 已新增"); setSync({ status: "ok", msg: "已同步" }); }
+      try {
+        await sheetsAdd(entry);
+        showToast("✅ 已新增並同步");
+        setSync({ status: "ok", msg: "已同步" });
+      } catch (e) {
+        const d = e._diag || diagnose("add", e);
+        showError(d);
+        setSync({ status: "error", msg: "新增失敗" });
+      }
     }
     setForm({ item: "", unit: "", amount: "", note: "", date: todayStr });
     setShowForm(false);
@@ -187,8 +274,15 @@ export default function App() {
     setEntries(prev => prev.filter(e => e.id !== deleteTarget.id));
     setDeleteTarget(null);
     setSync({ status: "loading", msg: "刪除中…" });
-    const r = await sheetsPost({ action: "delete", id: deleteTarget.id });
-    if (r) { showToast("🗑️ 已刪除"); setSync({ status: "ok", msg: "已同步" }); }
+    try {
+      await sheetsDelete(deleteTarget.id);
+      showToast("🗑️ 已刪除");
+      setSync({ status: "ok", msg: "已同步" });
+    } catch (e) {
+      const d = e._diag || diagnose("delete", e);
+      showError(d);
+      setSync({ status: "error", msg: "刪除失敗" });
+    }
   };
 
   const handleCancel = () => {
@@ -207,7 +301,6 @@ export default function App() {
   const weekDay = d => { if (!d) return ""; return "週" + ["日","一","二","三","四","五","六"][new Date(d + "T12:00:00").getDay()]; };
   const sign = v => v >= 0 ? "+" : "";
   const col  = v => v >= 0 ? "#22c55e" : "#f87171";
-
   const syncDotColor = { idle: "#64748b", loading: "#f59e0b", ok: "#22c55e", error: "#f87171" }[sync.status];
 
   return (
@@ -248,29 +341,33 @@ export default function App() {
         .modal-box{background:#111132;border:1px solid rgba(129,140,248,.28);border-radius:20px;padding:24px;width:100%;max-width:360px;max-height:82vh;overflow-y:auto}
         .section-card{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:16px 18px}
         .balance-card{border-radius:14px;padding:14px 16px;display:flex;flex-direction:column;gap:5px}
-        .divline{height:1px;background:rgba(255,255,255,.05)}
       `}</style>
 
-      {/* Toast */}
-      {toast && <div className="toast" style={{ borderColor: toast.ok ? "rgba(34,197,94,.4)" : "rgba(248,113,113,.4)" }}>{toast.msg}</div>}
+      {toast && (
+        <div className="toast" style={{ borderColor: toast.ok ? "rgba(34,197,94,.4)" : "rgba(248,113,113,.4)" }}>
+          {toast.msg}
+        </div>
+      )}
 
       {/* ── HEADER ── */}
       <div style={{ maxWidth: 700, margin: "0 auto", padding: "24px 18px 0" }}>
 
-        {/* Title row */}
         <div style={{ display: "flex", alignItems: "flex-start", justifyContent: "space-between", marginBottom: 4 }}>
           <div>
             <div style={{ fontFamily: "'Orbitron',monospace", fontSize: 9, letterSpacing: 5, color: "#4f52d3", textTransform: "uppercase", marginBottom: 5 }}>Monthly Shopping Record</div>
-            <h1 style={{ fontSize: 22, fontWeight: 700, color: "#f1f5f9", letterSpacing: "-.3px" }}>每月採買紀錄</h1>
+            <h1 style={{ fontSize: 22, fontWeight: 700, color: "#f1f5f9" }}>每月採買紀錄</h1>
           </div>
           {/* Sync badge */}
-          <div style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.08)", borderRadius: 20, padding: "6px 13px" }}>
-            <span className={`${sync.status === "loading" ? "pulse-anim" : ""}`}
+          <div
+            onClick={sync.status === "error" ? () => setErrDialog({ lines: [sync.msg || "發生未知錯誤"] }) : undefined}
+            style={{ display: "flex", alignItems: "center", gap: 5, background: "rgba(255,255,255,.05)", border: `1px solid ${sync.status === "error" ? "rgba(248,113,113,.35)" : "rgba(255,255,255,.08)"}`, borderRadius: 20, padding: "6px 13px", cursor: sync.status === "error" ? "pointer" : "default", transition: "border-color .2s" }}>
+            <span className={sync.status === "loading" ? "pulse-anim" : ""}
               style={{ width: 7, height: 7, borderRadius: 99, background: syncDotColor, display: "inline-block", flexShrink: 0 }} />
-            <span style={{ fontSize: 11, color: "#64748b", maxWidth: 110, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-              {sync.status === "loading" ? "同步中…" : sync.status === "ok" ? "已連線 Sheets" : sync.status === "error" ? "連線失敗" : "準備中"}
+            <span style={{ fontSize: 11, color: sync.status === "error" ? "#f87171" : "#64748b", maxWidth: 120, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+              {sync.status === "loading" ? "同步中…" : sync.status === "ok" ? "已連線 Sheets" : sync.status === "error" ? "失敗 點此查看 →" : "準備中"}
             </span>
-            <button onClick={fetchAll} title="重新整理" style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 14, lineHeight: 1, padding: 0 }}>↻</button>
+            <button onClick={(e) => { e.stopPropagation(); fetchAll(); }} title="重新整理"
+              style={{ background: "none", border: "none", cursor: "pointer", color: "#64748b", fontSize: 15, lineHeight: 1, padding: 0 }}>↻</button>
           </div>
         </div>
 
@@ -317,13 +414,11 @@ export default function App() {
 
         {/* Summary card */}
         <div className="section-card" style={{ marginBottom: 18 }}>
-          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 14, letterSpacing: .5 }}>{viewLabel} 採購總覽</div>
-
-          {/* Spent + bar */}
+          <div style={{ fontSize: 11, color: "#64748b", marginBottom: 14 }}>{viewLabel} 採購總覽</div>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-end", marginBottom: 10 }}>
             <div>
               <div style={{ fontSize: 10, color: "#64748b", marginBottom: 3 }}>本月採購支出</div>
-              <div style={{ fontSize: 28, fontWeight: 800, color: "#f1f5f9", letterSpacing: "-.5px", fontFamily: "'Orbitron',monospace" }}>
+              <div style={{ fontSize: 28, fontWeight: 800, color: "#f1f5f9", fontFamily: "'Orbitron',monospace" }}>
                 {monthSpent.toLocaleString()}
                 <span style={{ fontSize: 13, color: "#64748b", marginLeft: 4, fontFamily: "inherit", fontWeight: 400 }}>NT$</span>
               </div>
@@ -336,13 +431,11 @@ export default function App() {
           <div style={{ background: "rgba(255,255,255,.07)", borderRadius: 99, height: 8, overflow: "hidden", marginBottom: 18 }}>
             <div style={{ height: "100%", borderRadius: 99, width: `${pct}%`, background: `linear-gradient(90deg,${barColor},${barColor}99)`, transition: "width .6s cubic-bezier(.23,1,.44,1)", boxShadow: `0 0 12px ${barColor}77` }} />
           </div>
-
-          {/* 本月結餘 + 累計餘額 */}
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
             <div className="balance-card" style={{ background: "rgba(255,255,255,.04)", borderLeft: `3px solid ${col(monthBalance)}` }}>
               <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                 <span style={{ width: 6, height: 6, borderRadius: 99, background: col(monthBalance), display: "inline-block" }} />
-                <span style={{ fontSize: 10, color: "#64748b", fontWeight: 600, letterSpacing: .5 }}>本月結餘</span>
+                <span style={{ fontSize: 10, color: "#64748b", fontWeight: 600 }}>本月結餘</span>
               </div>
               <div style={{ fontSize: 20, fontWeight: 800, color: col(monthBalance), fontFamily: "'Orbitron',monospace" }}>
                 {sign(monthBalance)}{Math.abs(monthBalance).toLocaleString()}
@@ -354,7 +447,7 @@ export default function App() {
             <div className="balance-card" style={{ background: "rgba(255,255,255,.04)", borderLeft: `3px solid ${cumulativeBalance >= 0 ? "#818cf8" : "#f87171"}` }}>
               <div style={{ display: "flex", alignItems: "center", gap: 5 }}>
                 <span style={{ width: 6, height: 6, borderRadius: 99, background: cumulativeBalance >= 0 ? "#818cf8" : "#f87171", display: "inline-block" }} />
-                <span style={{ fontSize: 10, color: "#64748b", fontWeight: 600, letterSpacing: .5 }}>累計餘額</span>
+                <span style={{ fontSize: 10, color: "#64748b", fontWeight: 600 }}>累計餘額</span>
               </div>
               <div style={{ fontSize: 20, fontWeight: 800, color: cumulativeBalance >= 0 ? "#a5b4fc" : "#f87171", fontFamily: "'Orbitron',monospace" }}>
                 {sign(cumulativeBalance)}{Math.abs(cumulativeBalance).toLocaleString()}
@@ -365,10 +458,10 @@ export default function App() {
         </div>
       </div>
 
-      {/* ── MAIN content ── */}
+      {/* ── MAIN ── */}
       <div style={{ maxWidth: 700, margin: "0 auto", padding: "0 18px" }}>
 
-        {/* Export button row */}
+        {/* Export button */}
         <div style={{ display: "flex", justifyContent: "flex-end", marginBottom: 12 }}>
           <button onClick={() => setShowExport(true)}
             style={{ background: "rgba(255,255,255,.05)", border: "1px solid rgba(255,255,255,.1)", borderRadius: 20, padding: "6px 16px", color: "#94a3b8", fontSize: 12, cursor: "pointer", fontFamily: "inherit", display: "flex", alignItems: "center", gap: 6 }}>
@@ -419,11 +512,9 @@ export default function App() {
 
         {/* Entries table */}
         <div style={{ background: "rgba(255,255,255,.025)", border: "1px solid rgba(255,255,255,.06)", borderRadius: 18, overflow: "hidden" }}>
-
-          {/* Table header */}
           <div style={{ display: "grid", gridTemplateColumns: "56px 1fr 60px 88px 74px 58px", padding: "10px 14px", borderBottom: "1px solid rgba(255,255,255,.05)", background: "rgba(255,255,255,.03)" }}>
             {["日期","項目","單位","金額","備註","操作"].map(h => (
-              <div key={h} style={{ fontSize: 11, color: "#475569", fontWeight: 600, letterSpacing: .5 }}>{h}</div>
+              <div key={h} style={{ fontSize: 11, color: "#475569", fontWeight: 600 }}>{h}</div>
             ))}
           </div>
 
@@ -440,7 +531,6 @@ export default function App() {
             </div>
           ) : grouped.map(([date, dayEntries]) => (
             <div key={date}>
-              {/* Date group header */}
               <div style={{ display: "flex", alignItems: "center", gap: 8, padding: "7px 14px 4px", background: "rgba(79,82,211,.06)", borderTop: "1px solid rgba(255,255,255,.04)" }}>
                 <span style={{ fontSize: 13, fontWeight: 700, color: "#c7d2fe" }}>{fmtDate(date)}</span>
                 <span style={{ fontSize: 11, color: "#475569" }}>{weekDay(date)}</span>
@@ -459,10 +549,10 @@ export default function App() {
                   </div>
                   <div style={{ fontSize: 12, color: "#475569", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{entry.note || "—"}</div>
                   <div style={{ display: "flex", gap: 1 }}>
-                    <button className="bico" onClick={() => handleEdit(entry)} title="編輯">
+                    <button className="bico" onClick={() => handleEdit(entry)}>
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#818cf8" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/></svg>
                     </button>
-                    <button className="bico" onClick={() => setDeleteTarget(entry)} title="刪除">
+                    <button className="bico" onClick={() => setDeleteTarget(entry)}>
                       <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="#f87171" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-1 14a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2L5 6"/><path d="M10 11v6"/><path d="M14 11v6"/><path d="M9 6V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v2"/></svg>
                     </button>
                   </div>
@@ -471,14 +561,12 @@ export default function App() {
             </div>
           ))}
 
-          {/* Footer: totals */}
+          {/* Footer totals */}
           {filtered.length > 0 && (
             <div style={{ borderTop: "1px solid rgba(99,102,241,.22)", background: "rgba(79,82,211,.07)" }}>
               <div style={{ display: "grid", gridTemplateColumns: "56px 1fr 60px 88px 74px 58px", padding: "11px 14px 7px", alignItems: "center" }}>
-                <div style={{ gridColumn: "span 3", fontSize: 12, fontWeight: 700, color: "#a5b4fc", letterSpacing: .5 }}>月採購合計</div>
-                <div style={{ fontSize: 16, fontWeight: 800, color: "#818cf8", fontFamily: "'Orbitron',monospace" }}>
-                  {monthSpent.toLocaleString()}
-                </div>
+                <div style={{ gridColumn: "span 3", fontSize: 12, fontWeight: 700, color: "#a5b4fc" }}>月採購合計</div>
+                <div style={{ fontSize: 16, fontWeight: 800, color: "#818cf8", fontFamily: "'Orbitron',monospace" }}>{monthSpent.toLocaleString()}</div>
                 <div style={{ gridColumn: "span 2" }} />
               </div>
               <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", padding: "0 14px 13px", gap: 12 }}>
@@ -517,7 +605,7 @@ export default function App() {
         )}
       </div>
 
-      {/* ── FAB ── */}
+      {/* FAB */}
       {!showForm && (
         <div style={{ position: "fixed", bottom: 28, left: "50%", transform: "translateX(-50%)", zIndex: 50 }}>
           <button className="fab" onClick={() => { setShowForm(true); window.scrollTo({ top: 0, behavior: "smooth" }); }}>
@@ -527,7 +615,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Month picker modal ── */}
+      {/* Month picker */}
       {showMonthPicker && (
         <div className="overlay" onClick={() => setShowMonthPicker(false)}>
           <div className="modal-box" onClick={e => e.stopPropagation()}>
@@ -549,17 +637,13 @@ export default function App() {
                     onClick={() => { setViewMonth(m.ym); setShowMonthPicker(false); }}>
                     <div style={{ display: "flex", flexDirection: "column", gap: 2 }}>
                       <span style={{ fontSize: 14, fontWeight: 600, color: isActive ? "#c7d2fe" : "#e2e8f0" }}>{m.label}</span>
-                      <span style={{ fontSize: 11, color: "#475569" }}>
-                        {mE.length > 0 ? `${mE.length} 筆 · 支出 NT$${mS.toLocaleString()}` : "尚無記錄"}
-                      </span>
+                      <span style={{ fontSize: 11, color: "#475569" }}>{mE.length > 0 ? `${mE.length} 筆 · NT$${mS.toLocaleString()}` : "尚無記錄"}</span>
                     </div>
                     <div style={{ textAlign: "right", display: "flex", flexDirection: "column", gap: 3 }}>
-                      {mE.length > 0 && (
-                        <>
-                          <span style={{ fontSize: 12, fontWeight: 700, color: col(mB) }}>{sign(mB)}NT${Math.abs(mB).toLocaleString()} <span style={{ fontSize: 9, color: "#475569", fontWeight: 400 }}>結餘</span></span>
-                          <span style={{ fontSize: 11, color: cumB >= 0 ? "#818cf8" : "#f87171", fontWeight: 600 }}>累計 {sign(cumB)}NT${Math.abs(cumB).toLocaleString()}</span>
-                        </>
-                      )}
+                      {mE.length > 0 && <>
+                        <span style={{ fontSize: 12, fontWeight: 700, color: col(mB) }}>{sign(mB)}NT${Math.abs(mB).toLocaleString()} <span style={{ fontSize: 9, color: "#475569" }}>結餘</span></span>
+                        <span style={{ fontSize: 11, color: cumB >= 0 ? "#818cf8" : "#f87171", fontWeight: 600 }}>累計 {sign(cumB)}NT${Math.abs(cumB).toLocaleString()}</span>
+                      </>}
                       {isActive && <span style={{ fontSize: 10, color: "#6366f1" }}>▶ 目前</span>}
                     </div>
                   </button>
@@ -570,7 +654,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Export modal ── */}
+      {/* Export modal */}
       {showExport && (
         <div className="overlay" onClick={() => setShowExport(false)}>
           <div className="modal-box" style={{ maxWidth: 320 }} onClick={e => e.stopPropagation()}>
@@ -578,36 +662,31 @@ export default function App() {
               <div style={{ fontSize: 15, fontWeight: 700, color: "#f1f5f9" }}>📤 匯出資料</div>
               <button onClick={() => setShowExport(false)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 22, lineHeight: 1 }}>×</button>
             </div>
-
-            {/* Current month */}
             <div style={{ marginBottom: 18 }}>
-              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10, fontWeight: 600, letterSpacing: .5 }}>📅 {viewLabel}（{filtered.length} 筆）</div>
+              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10, fontWeight: 600 }}>📅 {viewLabel}（{filtered.length} 筆）</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <button className="expbtn" onClick={() => { exportCSV(filtered, viewLabel); setShowExport(false); }}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                   匯出本月 CSV
                   <span style={{ marginLeft: "auto", fontSize: 10, color: "#475569", background: "rgba(255,255,255,.05)", padding: "2px 8px", borderRadius: 10 }}>UTF-8</span>
                 </button>
                 <button className="expbtn" onClick={() => { exportXLSX(filtered, viewLabel); setShowExport(false); }}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
                   匯出本月 XLSX
                   <span style={{ marginLeft: "auto", fontSize: 10, color: "#475569", background: "rgba(255,255,255,.05)", padding: "2px 8px", borderRadius: 10 }}>Excel</span>
                 </button>
               </div>
             </div>
-
             <div style={{ height: 1, background: "rgba(255,255,255,.07)", marginBottom: 18 }} />
-
-            {/* All data */}
             <div>
-              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10, fontWeight: 600, letterSpacing: .5 }}>📦 全部資料（{entries.length} 筆）</div>
+              <div style={{ fontSize: 11, color: "#64748b", marginBottom: 10, fontWeight: 600 }}>📦 全部資料（{entries.length} 筆）</div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
                 <button className="expbtn" onClick={() => { exportCSV(entries, "全部"); setShowExport(false); }}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
                   匯出全部 CSV
                 </button>
                 <button className="expbtn" onClick={() => { exportXLSX(entries, "全部"); setShowExport(false); }}>
-                  <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+                  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
                   匯出全部 XLSX
                 </button>
               </div>
@@ -616,7 +695,7 @@ export default function App() {
         </div>
       )}
 
-      {/* ── Delete confirm ── */}
+      {/* Delete confirm */}
       {deleteTarget && (
         <div className="overlay" onClick={() => setDeleteTarget(null)}>
           <div className="modal-box" style={{ maxWidth: 290, textAlign: "center" }} onClick={e => e.stopPropagation()}>
@@ -626,10 +705,63 @@ export default function App() {
             <div style={{ fontSize: 12, color: "#64748b", marginBottom: 22 }}>NT$ {Number(deleteTarget.amount).toLocaleString()} · {deleteTarget.date}</div>
             <div style={{ display: "flex", gap: 10 }}>
               <button className="cbtn" style={{ flex: 1 }} onClick={() => setDeleteTarget(null)}>取消</button>
-              <button onClick={handleDelete}
-                style={{ flex: 1, background: "linear-gradient(135deg,#ef4444,#dc2626)", border: "none", borderRadius: 11, color: "#fff", padding: "11px", fontWeight: 700, cursor: "pointer", fontSize: 14, fontFamily: "inherit" }}>
-                刪除
-              </button>
+              <button onClick={handleDelete} style={{ flex: 1, background: "linear-gradient(135deg,#ef4444,#dc2626)", border: "none", borderRadius: 11, color: "#fff", padding: "11px", fontWeight: 700, cursor: "pointer", fontSize: 14, fontFamily: "inherit" }}>刪除</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* ── Error diagnosis dialog ── */}
+      {errDialog && (
+        <div className="overlay" onClick={() => setErrDialog(null)}>
+          <div className="modal-box" style={{ maxWidth: 380 }} onClick={e => e.stopPropagation()}>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 18 }}>
+              <div style={{ fontSize: 15, fontWeight: 700, color: "#f87171" }}>⚠️ 同步錯誤診斷</div>
+              <button onClick={() => setErrDialog(null)} style={{ background: "none", border: "none", color: "#64748b", cursor: "pointer", fontSize: 22, lineHeight: 1 }}>×</button>
+            </div>
+
+            {/* Diagnosis lines */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 10, marginBottom: 20 }}>
+              {errDialog.lines.map((line, i) => {
+                const isTitle  = line.startsWith("❌");
+                const isCause  = line.startsWith("🌐") || line.startsWith("📄") || line.startsWith("🔗") || line.startsWith("🔒") || line.startsWith("⚙️") || line.startsWith("⏱️") || line.startsWith("⚠️");
+                const isTip    = line.startsWith("💡");
+                const isRaw    = line.startsWith("📋");
+                return (
+                  <div key={i} style={{
+                    background: isTitle ? "rgba(248,113,113,.1)" : isTip ? "rgba(34,197,94,.08)" : isRaw ? "rgba(255,255,255,.04)" : "rgba(255,255,255,.04)",
+                    border: `1px solid ${isTitle ? "rgba(248,113,113,.25)" : isTip ? "rgba(34,197,94,.2)" : "rgba(255,255,255,.07)"}`,
+                    borderRadius: 10,
+                    padding: "10px 14px",
+                  }}>
+                    <div style={{ fontSize: isRaw ? 11 : 13, color: isTitle ? "#f87171" : isTip ? "#86efac" : isCause ? "#fbbf24" : "#94a3b8", fontWeight: isTitle || isTip ? 600 : 400, wordBreak: "break-all", fontFamily: isRaw ? "monospace" : "inherit" }}>
+                      {line}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+
+            {/* Checklist */}
+            <div style={{ background: "rgba(79,82,211,.1)", border: "1px solid rgba(99,102,241,.25)", borderRadius: 12, padding: "14px 16px", marginBottom: 18 }}>
+              <div style={{ fontSize: 12, fontWeight: 700, color: "#a5b4fc", marginBottom: 10 }}>🔧 常見解決步驟</div>
+              {[
+                "打開 Google Sheets → 擴充功能 → Apps Script",
+                "確認已貼上最新版 Code.gs 並儲存",
+                "點「部署」→「管理部署作業」→ 編輯（鉛筆）",
+                "版本選「建立新版本」→ 存取權限「所有人」→ 部署",
+                "回到 App 點右上角 ↻ 重新整理",
+              ].map((step, i) => (
+                <div key={i} style={{ display: "flex", gap: 10, alignItems: "flex-start", marginBottom: i < 4 ? 8 : 0 }}>
+                  <span style={{ width: 20, height: 20, borderRadius: 99, background: "rgba(99,102,241,.3)", display: "flex", alignItems: "center", justifyContent: "center", fontSize: 11, fontWeight: 700, color: "#a5b4fc", flexShrink: 0, marginTop: 1 }}>{i + 1}</span>
+                  <span style={{ fontSize: 12, color: "#94a3b8", lineHeight: 1.5 }}>{step}</span>
+                </div>
+              ))}
+            </div>
+
+            <div style={{ display: "flex", gap: 10 }}>
+              <button className="cbtn" style={{ flex: 1 }} onClick={() => setErrDialog(null)}>關閉</button>
+              <button className="abtn" style={{ flex: 1 }} onClick={() => { setErrDialog(null); fetchAll(); }}>↻ 重新整理</button>
             </div>
           </div>
         </div>
