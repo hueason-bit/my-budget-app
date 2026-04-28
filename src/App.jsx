@@ -3,25 +3,17 @@ import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 // ═══════════════════════════════════════════════════════════════
 //  每月採買紀錄  v1.0.0
 //  功能：Google Sheets 同步 / 月份查詢 / 匯出 CSV·XLSX
-//        可調預算 / 本月結餘 / 累計餘額 / 膽識控管
+//        可調預算 / 本月結餘 / 上月結餘 / 累計餘額
 // ═══════════════════════════════════════════════════════════════
 
 const SCRIPT_URL = "https://script.google.com/macros/s/AKfycbzl6WOdMDhXw2qh3h3joktXOqrlptl3fzTtNxLuLPdiGhly6MZij90cNYyUmd8BvSb_Bw/exec";
-const APP_VERSION = "v1.0.2";
+const APP_VERSION = "v1.0.3";
 
 const now = new Date();
 const todayStr  = now.toISOString().slice(0, 10);
 const currentYM = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
 // 允許選到未來 6 個月
 const maxDateStr = (() => { const d = new Date(now.getFullYear(), now.getMonth() + 7, 0); return d.toISOString().slice(0,10); })();
-
-// 膽識等級定義
-const DARE_LEVELS = [
-  { key: "safe",       label: "安全",   icon: "🟢", color: "#22c55e", desc: "嚴格控制，不超支",        limitPct: 80  },
-  { key: "moderate",   label: "穩健",   icon: "🔵", color: "#60a5fa", desc: "偶爾彈性，預留空間",      limitPct: 100 },
-  { key: "aggressive", label: "積極",   icon: "🟡", color: "#f59e0b", desc: "充分運用預算",            limitPct: 120 },
-  { key: "bold",       label: "大膽",   icon: "🔴", color: "#f87171", desc: "允許超支，挑戰極限",      limitPct: 150 },
-];
 
 function genMonths() {
   const out = [];
@@ -116,8 +108,6 @@ export default function App() {
   const [budgets, setBudgets]           = useState({}); // { "2026-04": 4000, ... }
   const [editBudget, setEditBudget]     = useState(false);
   const [budgetInput, setBudgetInput]   = useState("4000");
-  const [dareLevel, setDareLevel]       = useState("moderate"); // 膽識等級
-  const [showDare, setShowDare]         = useState(false);
   const [viewMonth, setViewMonth]       = useState(currentYM);
   const [form, setForm]                 = useState({ item: "", unit: "", amount: "", note: "", date: todayStr });
   const [editId, setEditId]             = useState(null);
@@ -163,21 +153,32 @@ export default function App() {
   const sheetsDelete = async id => { const r = await sheetsRequest({ action: "delete", id });          if (!r.ok) throw { _diag: diagnose("delete", new Error(r.error)) }; return r; };
 
   // ── 衍生資料 ────────────────────────────────────────────
-  const currentDare      = DARE_LEVELS.find(d => d.key === dareLevel) || DARE_LEVELS[1];
   // 當前查詢月份的預算（未設定則用預設值 4000）
   const viewMonthBudget  = budgets[viewMonth] ?? DEFAULT_BUDGET;
-  const dareLimit        = Math.round(viewMonthBudget * currentDare.limitPct / 100);
+
+  // 上個月的 ym
+  const prevYM = useMemo(() => {
+    const d = new Date(viewMonth + "-01");
+    d.setMonth(d.getMonth() - 1);
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}`;
+  }, [viewMonth]);
 
   const filtered = useMemo(() =>
     entries.filter(e => e.date?.startsWith(viewMonth)).sort((a, b) => b.date.localeCompare(a.date)),
     [entries, viewMonth]
   );
   const monthSpent       = filtered.reduce((s, e) => s + Number(e.amount), 0);
-  const monthBalance     = viewMonthBudget - monthSpent;
-  const dareRemain       = dareLimit - monthSpent;
+  const monthBalance     = viewMonthBudget - monthSpent;  // 可為負數
   const pctOfBudget      = Math.min((monthSpent / viewMonthBudget) * 100, 200);
-  const pctOfDare        = Math.min((monthSpent / dareLimit) * 100, 100);
   const barColor         = pctOfBudget < 60 ? "#22c55e" : pctOfBudget < 100 ? "#f59e0b" : "#f87171";
+
+  // 上月結餘
+  const prevMonthBudget  = budgets[prevYM] ?? DEFAULT_BUDGET;
+  const prevMonthSpent   = useMemo(() =>
+    entries.filter(e => e.date?.startsWith(prevYM)).reduce((s, e) => s + Number(e.amount), 0),
+    [entries, prevYM]
+  );
+  const prevMonthBalance = prevMonthBudget - prevMonthSpent; // 可為負數
 
   const cumulativeBalance = useMemo(() => {
     const months = [...new Set(entries.map(e => e.date?.slice(0, 7)).filter(Boolean))].filter(m => m <= viewMonth);
@@ -201,11 +202,6 @@ export default function App() {
   const handleAdd = async () => {
     if (!form.item.trim() || !form.amount || !form.date) { showToast("⚠️ 請填寫日期、項目、金額", false); return; }
     const amount       = Number(form.amount);
-    const afterSpent   = monthSpent + (editId ? 0 : amount);
-    // 膽識上限警告（新增時才檢查）
-    if (!editId && afterSpent > dareLimit) {
-      showToast(`⚠️ 已超出【${currentDare.label}】膽識上限 NT$${dareLimit.toLocaleString()}`, false);
-    }
     if (editId !== null) {
       const updated = { ...entries.find(e => e.id === editId), ...form, amount };
       setEntries(prev => prev.map(e => e.id === editId ? updated : e));
@@ -252,15 +248,12 @@ export default function App() {
   const col          = v => v >= 0 ? "#22c55e" : "#f87171";
   const syncDotColor = { idle:"#64748b", loading:"#f59e0b", ok:"#22c55e", error:"#f87171" }[sync.status];
 
-  // 膽識狀態文字
-  const dareStatus = () => {
-    if (monthSpent === 0)           return { text: "尚未開始消費", color: "#64748b" };
-    if (monthSpent <= viewMonthBudget * 0.6) return { text: `距預算上限還有 NT$${(viewMonthBudget - monthSpent).toLocaleString()}`, color: "#22c55e" };
-    if (monthSpent <= viewMonthBudget)       return { text: `預算剩餘 NT$${monthBalance.toLocaleString()}，留意支出`, color: "#f59e0b" };
-    if (monthSpent <= dareLimit)    return { text: `已超預算！膽識額度剩 NT$${dareRemain.toLocaleString()}`, color: currentDare.color };
-    return { text: `已突破膽識上限 NT$${dareLimit.toLocaleString()} ⚠️`, color: "#f87171" };
-  };
-  const ds = dareStatus();
+  // 預算狀態訊息
+  const budgetStatusText = monthSpent === 0
+    ? { text: "尚未開始採購", color: "#64748b" }
+    : monthBalance >= 0
+      ? { text: `距預算上限還有 NT$${monthBalance.toLocaleString()}`, color: "#22c55e" }
+      : { text: `已超出預算 NT$${Math.abs(monthBalance).toLocaleString()} ⚠️`, color: "#f87171" };
 
   return (
     <div style={{ minHeight:"100vh", background:"linear-gradient(135deg,#0a0a1a 0%,#111132 55%,#0a0a1a 100%)", fontFamily:"'Noto Sans TC','Helvetica Neue',sans-serif", color:"#e2e8f0", paddingBottom:120 }}>
@@ -299,8 +292,7 @@ export default function App() {
         .pulse-anim{animation:pulseA 1.2s infinite}
         .modal-box{background:#111132;border:1px solid rgba(129,140,248,.28);border-radius:20px;padding:24px;width:100%;max-width:360px;max-height:85vh;overflow-y:auto}
         .sc{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.07);border-radius:16px;padding:16px 18px}
-        .dare-btn{border:none;border-radius:12px;padding:12px 14px;cursor:pointer;font-family:inherit;transition:all .18s;text-align:left;width:100%;display:flex;align-items:center;gap:12px}
-        .dare-btn:hover{transform:translateX(3px)}
+
       `}</style>
 
       {toast && <div className="toast" style={{ borderColor: toast.ok ? "rgba(34,197,94,.4)" : "rgba(248,113,113,.4)" }}>{toast.msg}</div>}
@@ -353,12 +345,7 @@ export default function App() {
               </button>
             )}
           </div>
-          {/* Dare selector trigger */}
-          <button onClick={()=>setShowDare(true)}
-            style={{ background:`rgba(${currentDare.color==="#22c55e"?"34,197,94":currentDare.color==="#60a5fa"?"96,165,250":currentDare.color==="#f59e0b"?"245,158,11":"248,113,113"},.12)`, border:`1px solid ${currentDare.color}44`, borderRadius:22, padding:"5px 14px", color:currentDare.color, fontSize:13, fontWeight:600, cursor:"pointer", fontFamily:"inherit", display:"flex", alignItems:"center", gap:6 }}>
-            {currentDare.icon} {currentDare.label} 模式
-            <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><polyline points="6 9 12 15 18 9"/></svg>
-          </button>
+
         </div>
 
         {/* Month selector */}
@@ -407,7 +394,7 @@ export default function App() {
             </div>
           </div>
 
-          {/* 雙進度條：預算 & 膽識 */}
+          {/* 預算進度條 */}
           <div style={{ marginBottom:16 }}>
             <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:"#475569", marginBottom:4 }}>
               <span>預算進度 NT${viewMonthBudget.toLocaleString()}</span>
@@ -416,28 +403,20 @@ export default function App() {
             <div style={{ background:"rgba(255,255,255,.07)", borderRadius:99, height:7, overflow:"hidden", marginBottom:8 }}>
               <div style={{ height:"100%", borderRadius:99, width:`${Math.min(pctOfBudget,100)}%`, background:`linear-gradient(90deg,${barColor},${barColor}99)`, transition:"width .6s", boxShadow:`0 0 10px ${barColor}66` }} />
             </div>
-            <div style={{ display:"flex", justifyContent:"space-between", fontSize:10, color:"#475569", marginBottom:4 }}>
-              <span style={{ color:currentDare.color }}>{currentDare.icon} 膽識上限 NT${dareLimit.toLocaleString()}</span>
-              <span style={{ color:currentDare.color }}>{pctOfDare.toFixed(0)}%</span>
-            </div>
-            <div style={{ background:"rgba(255,255,255,.05)", borderRadius:99, height:5, overflow:"hidden" }}>
-              <div style={{ height:"100%", borderRadius:99, width:`${pctOfDare}%`, background:`linear-gradient(90deg,${currentDare.color},${currentDare.color}88)`, transition:"width .6s", boxShadow:`0 0 8px ${currentDare.color}55` }} />
-            </div>
-            {/* 膽識狀態訊息 */}
-            <div style={{ marginTop:8, fontSize:11, color:ds.color, fontWeight:600 }}>{ds.text}</div>
+            <div style={{ fontSize:11, color:budgetStatusText.color, fontWeight:600 }}>{budgetStatusText.text}</div>
           </div>
 
-          {/* 三欄：本月結餘 / 膽識剩餘 / 累計餘額 */}
+          {/* 三欄：本月結餘 / 上月結餘 / 累計餘額 */}
           <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", gap:10 }}>
             {[
-              { label:"本月結餘",  val:monthBalance,       c:col(monthBalance),      sub: monthBalance>=0?`剩 ${((monthBalance/viewMonthBudget)*100).toFixed(0)}%`:"超出預算 ⚠️" },
-              { label:"膽識剩餘",  val:dareRemain,         c:dareRemain>=0?currentDare.color:"#f87171", sub:dareRemain>=0?`${currentDare.icon} ${currentDare.label}`:"已破膽識 ⚠️" },
-              { label:"累計餘額",  val:cumulativeBalance,  c:cumulativeBalance>=0?"#a5b4fc":"#f87171",  sub:"截至本月" },
+              { label:"本月結餘", val:monthBalance,       c:col(monthBalance),                              sub: monthBalance>=0?`剩 ${((monthBalance/viewMonthBudget)*100).toFixed(0)}%`:"超出預算 ⚠️" },
+              { label:"上月結餘", val:prevMonthBalance,   c:col(prevMonthBalance),                          sub: prevMonthBalance>=0?`剩 ${((prevMonthBalance/prevMonthBudget)*100).toFixed(0)}%`:"上月超出 ⚠️" },
+              { label:"累計餘額", val:cumulativeBalance,  c:cumulativeBalance>=0?"#a5b4fc":"#f87171",       sub:"截至本月" },
             ].map(card => (
               <div key={card.label} style={{ background:"rgba(255,255,255,.04)", borderRadius:12, padding:"11px 12px", borderLeft:`3px solid ${card.c}` }}>
                 <div style={{ fontSize:9, color:"#64748b", fontWeight:600, marginBottom:4, letterSpacing:.5 }}>{card.label}</div>
                 <div style={{ fontSize:16, fontWeight:800, color:card.c, fontFamily:"'Orbitron',monospace", marginBottom:2 }}>
-                  {sign(card.val)}{Math.abs(card.val).toLocaleString()}
+                  {card.val < 0 ? "-" : "+"}{Math.abs(card.val).toLocaleString()}
                 </div>
                 <div style={{ fontSize:9, color:"#475569" }}>{card.sub}</div>
               </div>
@@ -484,11 +463,14 @@ export default function App() {
                 <input className="ifield" placeholder="選填" value={form.note} onChange={e=>setForm({...form,note:e.target.value})} />
               </div>
             </div>
-            {/* 即時膽識警示 */}
+            {/* 即時預算警示 */}
             {!editId && form.amount && Number(form.amount) > 0 && (() => {
               const after = monthSpent + Number(form.amount);
-              if (after > dareLimit) return <div style={{ fontSize:12, color:"#f87171", marginBottom:12, padding:"8px 12px", background:"rgba(248,113,113,.08)", borderRadius:8, border:"1px solid rgba(248,113,113,.2)" }}>⚠️ 新增後將超出{currentDare.icon} {currentDare.label}膽識上限（NT${dareLimit.toLocaleString()}），合計將達 NT${after.toLocaleString()}</div>;
-              if (after > viewMonthBudget) return <div style={{ fontSize:12, color:"#f59e0b", marginBottom:12, padding:"8px 12px", background:"rgba(245,158,11,.08)", borderRadius:8, border:"1px solid rgba(245,158,11,.2)" }}>📊 新增後超出預算，但仍在{currentDare.icon} {currentDare.label}膽識範圍內（NT${dareLimit.toLocaleString()}）</div>;
+              if (after > viewMonthBudget) return (
+                <div style={{ fontSize:12, color:"#f87171", marginBottom:12, padding:"8px 12px", background:"rgba(248,113,113,.08)", borderRadius:8, border:"1px solid rgba(248,113,113,.2)" }}>
+                  ⚠️ 新增後將超出本月預算（NT${viewMonthBudget.toLocaleString()}），合計將達 NT${after.toLocaleString()}
+                </div>
+              );
               return null;
             })()}
             <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
@@ -555,12 +537,14 @@ export default function App() {
               <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr 1fr", padding:"0 14px 13px", gap:10 }}>
                 {[
                   { label:"本月結餘", val:monthBalance,      c:col(monthBalance) },
-                  { label:"膽識剩餘", val:dareRemain,        c:dareRemain>=0?currentDare.color:"#f87171" },
+                  { label:"上月結餘", val:prevMonthBalance,  c:col(prevMonthBalance) },
                   { label:"累計餘額", val:cumulativeBalance, c:cumulativeBalance>=0?"#a5b4fc":"#f87171" },
                 ].map(card=>(
                   <div key={card.label} style={{ background:"rgba(255,255,255,.04)", borderRadius:10, padding:"9px 11px", borderLeft:`3px solid ${card.c}` }}>
                     <div style={{ fontSize:9, color:"#64748b", marginBottom:3, fontWeight:600 }}>{card.label}</div>
-                    <div style={{ fontSize:15, fontWeight:800, color:card.c, fontFamily:"'Orbitron',monospace" }}>{sign(card.val)}{Math.abs(card.val).toLocaleString()}</div>
+                    <div style={{ fontSize:15, fontWeight:800, color:card.c, fontFamily:"'Orbitron',monospace" }}>
+                      {card.val < 0 ? "-" : "+"}{Math.abs(card.val).toLocaleString()}
+                    </div>
                   </div>
                 ))}
               </div>
@@ -571,17 +555,38 @@ export default function App() {
         {/* Stats */}
         {filtered.length>0 && (
           <div style={{ display:"grid", gridTemplateColumns:"repeat(3,1fr)", gap:10, marginTop:12 }}>
-            {[
-              { label:"筆數",    value:`${filtered.length} 筆`,                                              icon:"📝" },
-              { label:"平均每筆", value:`NT$${Math.round(monthSpent/filtered.length).toLocaleString()}`,     icon:"📊" },
-              { label:"最高消費", value:`NT$${Math.max(...filtered.map(e=>e.amount)).toLocaleString()}`,      icon:"🔝" },
-            ].map(s=>(
-              <div key={s.label} style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:14, padding:"13px 10px", textAlign:"center" }}>
-                <div style={{ fontSize:18, marginBottom:5 }}>{s.icon}</div>
-                <div style={{ fontSize:13, fontWeight:700, color:"#e2e8f0", marginBottom:1 }}>{s.value}</div>
-                <div style={{ fontSize:11, color:"#475569" }}>{s.label}</div>
-              </div>
-            ))}
+            {/* 筆數 */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:14, padding:"13px 10px", textAlign:"center" }}>
+              <div style={{ fontSize:18, marginBottom:5 }}>📝</div>
+              <div style={{ fontSize:13, fontWeight:700, color:"#e2e8f0", marginBottom:1 }}>{filtered.length} 筆</div>
+              <div style={{ fontSize:11, color:"#475569" }}>筆數</div>
+            </div>
+            {/* 本月 vs 上月比較 */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:14, padding:"13px 10px", textAlign:"center" }}>
+              <div style={{ fontSize:18, marginBottom:5 }}>📊</div>
+              {(() => {
+                const diff = monthSpent - prevMonthSpent;
+                const diffColor = diff <= 0 ? "#22c55e" : "#f87171";
+                const diffIcon  = diff <= 0 ? "▼" : "▲";
+                return (
+                  <>
+                    <div style={{ fontSize:12, fontWeight:700, color:"#e2e8f0", marginBottom:3 }}>
+                      NT${monthSpent.toLocaleString()}
+                    </div>
+                    <div style={{ fontSize:11, color:diffColor, fontWeight:600, marginBottom:2 }}>
+                      {diffIcon} {diff === 0 ? "持平" : `${diff < 0 ? "" : "+"}NT$${Math.abs(diff).toLocaleString()}`}
+                    </div>
+                    <div style={{ fontSize:10, color:"#475569" }}>vs 上月 NT${prevMonthSpent.toLocaleString()}</div>
+                  </>
+                );
+              })()}
+            </div>
+            {/* 最高消費 */}
+            <div style={{ background:"rgba(255,255,255,.03)", border:"1px solid rgba(255,255,255,.06)", borderRadius:14, padding:"13px 10px", textAlign:"center" }}>
+              <div style={{ fontSize:18, marginBottom:5 }}>🔝</div>
+              <div style={{ fontSize:13, fontWeight:700, color:"#e2e8f0", marginBottom:1 }}>NT${Math.max(...filtered.map(e=>e.amount)).toLocaleString()}</div>
+              <div style={{ fontSize:11, color:"#475569" }}>最高消費</div>
+            </div>
           </div>
         )}
       </div>
@@ -596,54 +601,6 @@ export default function App() {
         </div>
       )}
 
-      {/* ── 膽識控管 Modal ── */}
-      {showDare && (
-        <div className="overlay" onClick={()=>setShowDare(false)}>
-          <div className="modal-box" style={{ maxWidth:360 }} onClick={e=>e.stopPropagation()}>
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:6 }}>
-              <div style={{ fontSize:15, fontWeight:700, color:"#f1f5f9" }}>🎯 膽識控管</div>
-              <button onClick={()=>setShowDare(false)} style={{ background:"none", border:"none", color:"#64748b", cursor:"pointer", fontSize:22, lineHeight:1 }}>×</button>
-            </div>
-            <div style={{ fontSize:12, color:"#64748b", marginBottom:18 }}>設定本月願意承擔的支出風險等級</div>
-
-            <div style={{ display:"flex", flexDirection:"column", gap:10, marginBottom:20 }}>
-              {DARE_LEVELS.map(lv => {
-                const isOn = dareLevel === lv.key;
-                const limitAmt = Math.round(budget * lv.limitPct / 100);
-                return (
-                  <button key={lv.key} className="dare-btn"
-                    onClick={()=>{setDareLevel(lv.key);showToast(`${lv.icon} 已切換為【${lv.label}】模式`);setShowDare(false);}}
-                    style={{ background:isOn?`${lv.color}18`:"rgba(255,255,255,.04)", border:`1.5px solid ${isOn?lv.color:"rgba(255,255,255,.08)"}`, color:"#e2e8f0" }}>
-                    <span style={{ fontSize:22 }}>{lv.icon}</span>
-                    <div style={{ flex:1 }}>
-                      <div style={{ display:"flex", alignItems:"center", gap:8, marginBottom:3 }}>
-                        <span style={{ fontSize:14, fontWeight:700, color:isOn?lv.color:"#e2e8f0" }}>{lv.label}</span>
-                        <span style={{ fontSize:10, color:"#64748b", background:"rgba(255,255,255,.06)", padding:"1px 7px", borderRadius:10 }}>上限 {lv.limitPct}%</span>
-                        {isOn && <span style={{ fontSize:10, color:lv.color, fontWeight:700 }}>✓ 使用中</span>}
-                      </div>
-                      <div style={{ fontSize:12, color:"#64748b" }}>{lv.desc}</div>
-                      <div style={{ fontSize:11, color:lv.color, fontWeight:600, marginTop:3 }}>
-                        允許支出上限：NT$ {limitAmt.toLocaleString()}
-                      </div>
-                    </div>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* 當月狀態預覽 */}
-            <div style={{ background:"rgba(255,255,255,.04)", border:"1px solid rgba(255,255,255,.07)", borderRadius:12, padding:"13px 15px" }}>
-              <div style={{ fontSize:11, color:"#64748b", fontWeight:600, marginBottom:8 }}>📊 本月狀態預覽</div>
-              <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8 }}>
-                <div><div style={{ fontSize:10, color:"#64748b" }}>本月支出</div><div style={{ fontSize:14, fontWeight:700, color:"#f1f5f9" }}>NT$ {monthSpent.toLocaleString()}</div></div>
-                <div><div style={{ fontSize:10, color:"#64748b" }}>預算</div><div style={{ fontSize:14, fontWeight:700, color:"#818cf8" }}>NT$ {viewMonthBudget.toLocaleString()}</div></div>
-                <div><div style={{ fontSize:10, color:"#64748b" }}>膽識上限</div><div style={{ fontSize:14, fontWeight:700, color:currentDare.color }}>NT$ {dareLimit.toLocaleString()}</div></div>
-                <div><div style={{ fontSize:10, color:"#64748b" }}>膽識剩餘</div><div style={{ fontSize:14, fontWeight:700, color:dareRemain>=0?currentDare.color:"#f87171" }}>{sign(dareRemain)}NT$ {Math.abs(dareRemain).toLocaleString()}</div></div>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
 
       {/* ── Month picker ── */}
       {showMonthPicker && (
@@ -671,8 +628,8 @@ export default function App() {
                     </div>
                     <div style={{ textAlign:"right", display:"flex", flexDirection:"column", gap:3 }}>
                       {mE.length>0&&<>
-                        <span style={{ fontSize:12, fontWeight:700, color:col(mB) }}>{sign(mB)}NT${Math.abs(mB).toLocaleString()} <span style={{ fontSize:9, color:"#475569" }}>結餘</span></span>
-                        <span style={{ fontSize:11, color:cumB>=0?"#818cf8":"#f87171", fontWeight:600 }}>累計 {sign(cumB)}NT${Math.abs(cumB).toLocaleString()}</span>
+                        <span style={{ fontSize:12, fontWeight:700, color:col(mB) }}>{mB<0?"-":"+"}NT${Math.abs(mB).toLocaleString()} <span style={{ fontSize:9, color:"#475569" }}>結餘</span></span>
+                        <span style={{ fontSize:11, color:cumB>=0?"#818cf8":"#f87171", fontWeight:600 }}>累計 {cumB<0?"-":"+"}NT${Math.abs(cumB).toLocaleString()}</span>
                       </>}
                       {isActive&&<span style={{ fontSize:10, color:"#6366f1" }}>▶ 目前</span>}
                     </div>
